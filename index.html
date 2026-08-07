@@ -558,7 +558,7 @@ input.ai:focus,input.ai-b:focus,input.ai-e:focus { border-color: var(--primary) 
   .topbar-logo { width: 26px; height: 26px; }
   .stat-card { min-width: 100%; }
   /* 超小屏：隐藏同步按钮，仅保留导入导出 */
-  #btnSyncOut, #btnSyncIn { display: none; }
+  #btnSyncLink, #btnSyncOut, #btnSyncIn { display: none; }
 }
 </style>
 </head>
@@ -642,6 +642,10 @@ input.ai:focus,input.ai-b:focus,input.ai-e:focus { border-color: var(--primary) 
     <!-- Check icon -->
     <symbol id="ic-check" viewBox="0 0 24 24">
       <path d="M20 6L9 17l-5-5"/>
+    </symbol>
+    <!-- Cloud icon -->
+    <symbol id="ic-cloud" viewBox="0 0 24 24">
+      <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>
     </symbol>
     <!-- Save icon -->
     <symbol id="ic-save" viewBox="0 0 24 24">
@@ -737,7 +741,9 @@ input.ai:focus,input.ai-b:focus,input.ai-e:focus { border-color: var(--primary) 
   </div>
   <div class="topbar-actions">
     <span class="sync-indicator" id="syncIndicator"></span>
-    <button class="btn btn-sm" id="btnSyncOut"><svg class="ic ic-sm"><use href="#ic-sync2phone"/></svg><span>同步码</span></button>
+    <button class="btn btn-sm btn-primary" id="btnSyncLink"><svg class="ic ic-sm"><use href="#ic-sync2phone"/></svg><span>同步链接</span></button>
+    <button class="btn btn-sm" id="btnSyncOut"><svg class="ic ic-sm"><use href="#ic-cloud"/></svg><span>上传</span></button>
+    <button class="btn btn-sm" id="btnSyncIn"><svg class="ic ic-sm"><use href="#ic-download"/></svg><span>拉取</span></button>
     <button class="btn btn-sm" id="btnExport"><svg class="ic ic-sm"><use href="#ic-download"/></svg><span>导出</span></button>
     <button class="btn btn-sm" id="btnImport"><svg class="ic ic-sm"><use href="#ic-upload"/></svg><span>导入</span></button>
   </div>
@@ -751,8 +757,8 @@ input.ai:focus,input.ai-b:focus,input.ai-e:focus { border-color: var(--primary) 
     <div class="nav-item" data-module="expense"><svg class="ic"><use href="#ic-expense"/></svg> Large Expense Records</div>
     <div class="nav-item" data-module="quote"><svg class="ic"><use href="#ic-quote"/></svg> Daily Growth Quote</div>
     <div class="nav-label">数据管理</div>
-    <div class="nav-item" data-action="sync-out"><svg class="ic"><use href="#ic-sync2phone"/></svg> 同步到手机</div>
-    <div class="nav-item" data-action="sync-in"><svg class="ic"><use href="#ic-syncFromPhone"/></svg> 从手机恢复</div>
+    <div class="nav-item" data-action="sync-out"><svg class="ic"><use href="#ic-cloud"/></svg> 上传到云端</div>
+    <div class="nav-item" data-action="sync-in"><svg class="ic"><use href="#ic-download"/></svg> 从云端拉取</div>
     <div class="nav-item" data-action="export"><svg class="ic"><use href="#ic-download"/></svg> 导出全部数据</div>
     <div class="nav-item" data-action="import"><svg class="ic"><use href="#ic-upload"/></svg> 导入数据</div>
   </nav>
@@ -950,21 +956,76 @@ var K = {
   QOV:  'wb_quote_override'
 };
 
-/* ===== jsonblob.com 云端同步 ===== */
-/* 检测：本地文件打开时不走云端同步 */
+/* ===== 清理旧 Service Worker ===== */
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then(function(regs) {
+    regs.forEach(function(reg) { reg.unregister(); });
+  });
+}
+
+/* ===== GitHub API 直接同步（无需 SW，浏览器直连 api.github.com） ===== */
 var _isLocalFile = (window.location.protocol === 'file:');
-var _blobId = _isLocalFile ? null : G('wb_blob_id', null);
+var _shareId = _isLocalFile ? null : (function(){
+  try { localStorage.removeItem('wb_blob_id'); } catch(e){}
+  var p = new URLSearchParams(window.location.search);
+  var sid = p.get('sid') || p.get('bid') || p.get('id');
+  if (sid) { localStorage.setItem('wb_share_id', JSON.stringify(sid)); return sid; }
+  return G('wb_share_id', 'default');
+})();
 var _syncing = false;
+var _initialLoadDone = false;
 var _lastSync = 0;
 var _syncTimer = null;
-var _blobDirty = false;
-var _blobDebounce = null;
 var _blobOnline = false;
+/* ===== Supabase 云端数据库同步 ===== */
+var _sbUrl = 'https://cgqpaygusagnaxzysypi.supabase.co';
+var _sbKey = 'sb_publishable_MOM6VGs4f1QIErl6DlELg_idpb_2ZA';
 
-/* API 地址 */
-var _blobApi = 'https://jsonblob.com/api/jsonBlob';
+function _sbHeaders() {
+  return { 'apikey': _sbKey, 'Authorization': 'Bearer ' + _sbKey, 'Content-Type': 'application/json' };
+}
 
-/* 更新同步状态指示器 */
+/* 写入云端（防抖 600ms，UPSERT 一条记录到 Supabase） */
+function _syncToCloud() {
+  if (_isLocalFile) return;
+  if (_blobDebounce) clearTimeout(_blobDebounce);
+  _blobDebounce = setTimeout(function() {
+    _blobDebounce = null;
+    /* 收集所有 localStorage 数据 */
+    var all = {};
+    Object.keys(K).forEach(function(k){ var v = G(k, null); if (v !== null) all[k] = v; });
+    _doUpsert(all, 0);
+  }, 600);
+}
+
+function _doUpsert(all, retry) {
+  if (retry > 2) { _updateSyncUI('ic-close', '离线'); return; }
+  var x = new XMLHttpRequest();
+  x.open('POST', _sbUrl + '/rest/v1/workbench_data', true);
+  var hdrs = _sbHeaders();
+  Object.keys(hdrs).forEach(function(k){ x.setRequestHeader(k, hdrs[k]); });
+  x.setRequestHeader('Prefer', 'resolution=merge-duplicates');
+  x.timeout = 10000;
+  x.onload = function() {
+    if (x.status === 201 || x.status === 200) {
+      _lastSync = Date.now(); _blobOnline = true;
+      _updateSyncUI('ic-cloud', '已保存');
+      setTimeout(function(){ _updateSyncUI('', ''); }, 2000);
+    } else if (x.status === 409) {
+      /* 冲突重试 */
+      setTimeout(function(){ _doUpsert(all, retry + 1); }, 500);
+    } else {
+      _blobOnline = false; _updateSyncUI('ic-close', '离线');
+    }
+  };
+  x.onerror = function() { _updateSyncUI('ic-close', '离线'); };
+  x.send(JSON.stringify({
+    share_id: _shareId,
+    data: all,
+    updated_at: new Date().toISOString()
+  }));
+}
+
 function _updateSyncUI(icon, text) {
   if (_isLocalFile) return;
   var el = document.getElementById('syncIndicator');
@@ -972,64 +1033,9 @@ function _updateSyncUI(icon, text) {
     var i = icon ? '<svg class="ic ic-sm"><use href="#'+icon+'"/></svg>' : '';
     el.innerHTML = i + '<span>'+text+'</span>';
     el.className = 'sync-indicator';
-    if (text === '在线' || text === '已同步') el.className = 'sync-indicator sync-online';
+    if (text === '在线' || text === '已同步' || text === '已保存') el.className = 'sync-indicator sync-online';
     if (text === '离线') el.className = 'sync-indicator sync-offline';
   }
-}
-
-/* 创建新 blob */
-function _createBlob(cb) {
-  var all = {};
-  Object.keys(K).forEach(function(k){ var v = G(k, null); if (v !== null) all[k] = v; });
-  try {
-    var x = new XMLHttpRequest();
-    x.open('POST', _blobApi, true);
-    x.setRequestHeader('Content-Type', 'application/json');
-    x.timeout = 8000;
-    x.onload = function() {
-      if (x.status === 201) {
-        _blobId = x.getResponseHeader('X-jsonblob-id');
-        if (_blobId) {
-          localStorage.setItem('wb_blob_id', JSON.stringify(_blobId));
-          _blobOnline = true;
-          _lastSync = Date.now();
-          _updateSyncUI('ic-check', '在线');
-          setTimeout(function(){ _updateSyncUI('', ''); }, 3000);
-          if (cb) cb(true);
-          return;
-        }
-      }
-      if (cb) cb(false);
-    };
-    x.onerror = function() { if (cb) cb(false); };
-    x.send(JSON.stringify(all));
-  } catch(e) { if (cb) cb(false); }
-}
-
-/* 写入 blob（防抖合并） */
-function _syncToBlob() {
-  if (_isLocalFile || _blobDirty) return;
-  _blobDirty = true;
-  if (_blobDebounce) clearTimeout(_blobDebounce);
-  _blobDebounce = setTimeout(function() {
-    _blobDirty = false;
-    _blobDebounce = null;
-    if (!_blobId) return;
-    var all = {};
-    Object.keys(K).forEach(function(k){ var v = G(k, null); if (v !== null) all[k] = v; });
-    try {
-      var x = new XMLHttpRequest();
-      x.open('PUT', _blobApi + '/' + _blobId, true);
-      x.setRequestHeader('Content-Type', 'application/json');
-      x.timeout = 5000;
-      x.onload = function() {
-        if (x.status === 200) { _lastSync = Date.now(); _blobOnline = true; }
-        else if (x.status === 404) { _blobId = null; _createBlob(function(ok){}); }
-      };
-      x.onerror = function() { _blobDirty = true; };
-      x.send(JSON.stringify(all));
-    } catch(e) { _blobDirty = true; }
-  }, 600);
 }
 
 /* ===== 工具函数 ===== */
@@ -1040,7 +1046,7 @@ function G(k, def) {
 function S(k, v) {
   try { localStorage.setItem(k, JSON.stringify(v)); } catch(e) { T('存储空间不足'); }
   /* 自动同步到云端 */
-  _syncToBlob();
+  _syncToCloud();
 }
 function M(n) { n = Number(n) || 0; return '¥' + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
 function E(x) { if (!x) return ''; return String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -1579,39 +1585,26 @@ function RQL() {
   });
 }
 
-/* ===== 同步码 ===== */
+/* ===== 云端同步按钮 ===== */
+function copySyncLink() {
+  if (_isLocalFile) { T('请使用在线版打开此功能'); return; }
+  var url = window.location.origin + window.location.pathname + '?sid=' + _shareId;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(url).then(function(){ T('链接已复制！在其他设备打开即可自动同步'); }).catch(function(){ T('复制失败，请允许剪贴板权限'); });
+  } else { T('复制失败，请使用支持的浏览器'); }
+}
+
 function syncOut() {
-  var bk = {v:'1.0', date: new Date().toISOString(), data:{}, blobId: _blobId || null};
-  Object.keys(K).forEach(function(k){ bk.data[k] = G(K[k], null); });
-  var code = btoa(unescape(encodeURIComponent(JSON.stringify(bk))));
-  navigator.clipboard.writeText(code).then(function(){
-    T('同步码已复制（'+code.length+'字符），粘贴到另一台设备即可恢复并自动开启同步');
-  }).catch(function(){
-    T('复制失败，请允许剪贴板权限');
-  });
+  if (_isLocalFile) { T('请使用在线版打开此功能'); return; }
+  _updateSyncUI('ic-refresh', '上传中');
+  var all = {};
+  Object.keys(K).forEach(function(k){ var v = G(k, null); if (v !== null) all[k] = v; });
+  _doUpsert(all, 0);
 }
 
 function syncIn() {
-  var code = prompt('请粘贴从电脑端复制的同步码：');
-  if (!code || !code.trim()) return;
-  try {
-    code = code.trim();
-    var bk = JSON.parse(decodeURIComponent(escape(atob(code))));
-    if (!bk.data) { T('同步码格式不正确'); return; }
-    CF('确认同步', '同步码创建于 '+new Date(bk.date).toLocaleString('zh-CN')+'，同步将覆盖当前所有数据，确定继续？', function(){
-      Object.keys(bk.data).forEach(function(k){ if (bk.data[k]!==null) S(k, bk.data[k]); });
-      /* 同步 blob ID，之后自动云端同步 */
-      if (bk.blobId) {
-        _blobId = bk.blobId;
-        localStorage.setItem('wb_blob_id', JSON.stringify(_blobId));
-        startPolling();
-        T('同步成功，已开启云端自动同步');
-      } else {
-        T('同步成功');
-      }
-      initAll();
-    });
-  } catch(err) { T('同步码解析失败，请检查是否完整复制'); }
+  if (_isLocalFile) { T('请使用在线版打开此功能'); return; }
+  _loadFromCloud(false);
 }
 
 /* ===== 数据备份 ===== */
@@ -1653,73 +1646,85 @@ function initAll() {
   }
 }
 
-/* ===== 从云端加载数据 ===== */
-
-function _loadFromBlob(silent) {
-  if (_isLocalFile || !_blobId || _syncing) return;
+/* ===== 从 Supabase 云端拉取数据 ===== */
+function _loadFromCloud(silent) {
+  if (_isLocalFile || _syncing) return;
   _syncing = true;
-  try {
-    var x = new XMLHttpRequest();
-    x.open('GET', _blobApi + '/' + _blobId + '?_=' + Date.now(), true);
-    x.timeout = 5000;
-    x.onload = function() {
-      _syncing = false;
-      if (x.status !== 200) {
-        if (x.status === 404 || x.status === 410) {
-          _blobId = null; _createBlob(function(ok){ if (ok && !_initialLoadDone) _initialLoadDone = true; });
-        }
-        if (!silent) _updateSyncUI('ic-close', '离线');
-        return;
-      }
+  var x = new XMLHttpRequest();
+  x.open('GET', _sbUrl + '/rest/v1/workbench_data?share_id=eq.' + encodeURIComponent(_shareId) + '&select=*', true);
+  var hdrs = _sbHeaders();
+  Object.keys(hdrs).forEach(function(k){ x.setRequestHeader(k, hdrs[k]); });
+  x.timeout = 12000;
+  var done = false;
+  function finish(icon, text) {
+    if (done) return; done = true;
+    _syncing = false;
+    if (icon && text && !silent) _updateSyncUI(icon, text);
+  }
+  x.onload = function() {
+    if (x.status === 200) {
       try {
-        var svr = JSON.parse(x.responseText);
+        var rows = JSON.parse(x.responseText);
         _blobOnline = true; _lastSync = Date.now();
         var merged = false;
-        Object.keys(K).forEach(function(k) {
-          var sv = svr[k]; if (sv === undefined || sv === null) return;
-          var lv = G(k, null);
-          if (JSON.stringify(sv) !== JSON.stringify(lv)) {
-            localStorage.setItem(k, JSON.stringify(sv)); merged = true;
-          }
-        });
-        if (merged) {
-          _updateSyncUI('ic-check', '已同步');
-          setTimeout(function(){ _updateSyncUI('', ''); }, 2000);
-          if (_initialLoadDone) initAll();
+        if (rows && rows.length > 0) {
+          var svr = rows[0].data || {};
+          Object.keys(K).forEach(function(k) {
+            var sv = svr[k]; if (sv === undefined || sv === null) return;
+            var lv = G(k, null);
+            if (JSON.stringify(sv) !== JSON.stringify(lv)) {
+              localStorage.setItem(k, JSON.stringify(sv)); merged = true;
+            }
+          });
         }
         if (!_initialLoadDone) { _initialLoadDone = true; initAll(); }
-      } catch(e) { if (!silent) _updateSyncUI('ic-close', '离线'); }
-    };
-    x.onerror = function() { _syncing = false; if (!silent) _updateSyncUI('ic-close', '离线'); };
-    x.ontimeout = function() { _syncing = false; if (!silent) _updateSyncUI('ic-close', '离线'); };
-    if (!silent) _updateSyncUI('ic-refresh', '同步中');
-    x.send();
-  } catch(e) { _syncing = false; }
+        else if (merged) { initAll(); }
+        if (merged && !silent) { _updateSyncUI('ic-check', '已同步'); setTimeout(function(){ _updateSyncUI('', ''); }, 2000); }
+        finish();
+      } catch(e) { finish('ic-close', '离线'); }
+    } else if (x.status === 404 || (x.status === 200 && x.responseText === '[]')) {
+      /* 云端没有数据，初始化一条空记录 */
+      _blobOnline = true;
+      if (!_initialLoadDone) { _initialLoadDone = true; initAll(); }
+      /* 把本地数据推上去 */
+      var all = {};
+      Object.keys(K).forEach(function(k){ var v = G(k, null); if (v !== null) all[k] = v; });
+      if (Object.keys(all).length > 0) _doUpsert(all, 0);
+      finish();
+    } else {
+      finish('ic-close', '离线');
+    }
+  };
+  x.onerror = function() { finish('ic-close', '离线'); };
+  x.ontimeout = function() { finish('ic-close', '离线'); };
+  if (!silent) _updateSyncUI('ic-refresh', '同步中');
+  x.send();
+  /* 安全超时 */
+  setTimeout(function() { finish('ic-close', '离线'); }, 15000);
 }
 
 /* 定时同步（每 10 秒检查一次云端） */
 function startPolling() {
   if (_isLocalFile) return;
   if (_syncTimer) clearInterval(_syncTimer);
-  _syncTimer = setInterval(function() { _loadFromBlob(true); }, 10000);
+  _syncTimer = setInterval(function() { _loadFromCloud(true); }, 10000);
 }
 
 /* 初始化云端同步 */
 function _initCloudSync() {
   if (_isLocalFile) return;
-  if (_blobId) {
-    _loadFromBlob(false);
-    setTimeout(function() { if (!_initialLoadDone) _initialLoadDone = true; }, 8000);
-  } else {
-    _createBlob(function(ok) { if (ok && !_initialLoadDone) _initialLoadDone = true; });
-  }
+  _loadFromCloud(false);
+  setTimeout(function() { if (!_initialLoadDone) { _initialLoadDone = true; initAll(); } }, 8000);
   startPolling();
 }
 
 /* 页面可见时立即同步 */
 document.addEventListener('visibilitychange', function() {
-  if (document.visibilityState === 'visible' && _initialLoadDone) _loadFromBlob(true);
+  if (document.visibilityState === 'visible' && _initialLoadDone) _loadFromCloud(true);
 });
+
+/* 启动同步 */
+if (!_isLocalFile) _initCloudSync();
 
 /* ===== 全局事件委托 ===== */
 document.addEventListener('DOMContentLoaded', function() {
@@ -1743,6 +1748,7 @@ document.addEventListener('DOMContentLoaded', function() {
   });
 
   /* 顶部按钮 */
+  document.getElementById('btnSyncLink').addEventListener('click', copySyncLink);
   document.getElementById('btnSyncOut').addEventListener('click', syncOut);
   document.getElementById('btnSyncIn').addEventListener('click', syncIn);
   document.getElementById('btnExport').addEventListener('click', expData);
@@ -1814,8 +1820,7 @@ document.addEventListener('DOMContentLoaded', function() {
   A();
   RA();
 
-  /* 启动云端同步 */
-  _initCloudSync();
+  /* 云端同步由 Service Worker 注册流程触发，不在此处重复调用 */
 });
 </script>
 

@@ -977,6 +977,7 @@ var _initialLoadDone = false;
 var _lastSync = 0;
 var _syncTimer = null;
 var _blobOnline = false;
+var _blobDebounce = null;
 /* ===== Supabase 云端数据库同步 ===== */
 var _sbUrl = 'https://cgqpaygusagnaxzysypi.supabase.co';
 var _sbKey = 'sb_publishable_MOM-6VGs4f1QIErl6DlELg_idpb_2ZA';
@@ -991,34 +992,34 @@ function _syncToCloud() {
   if (_blobDebounce) clearTimeout(_blobDebounce);
   _blobDebounce = setTimeout(function() {
     _blobDebounce = null;
-    /* 收集所有 localStorage 数据 */
     var all = {};
-    Object.keys(K).forEach(function(k){ var v = G(k, null); if (v !== null) all[k] = v; });
+    Object.keys(K).forEach(function(k){ var key = K[k]; var v = G(key, null); if (v !== null) all[key] = v; });
     _doUpsert(all, 0);
   }, 600);
 }
 
 function _doUpsert(all, retry) {
-  if (retry > 2) { _updateSyncUI('ic-close', '离线'); return; }
+  if (retry > 2) { _updateSyncUI('ic-close', '保存失败'); return; }
+  if (retry === 0) _updateSyncUI('ic-refresh', '保存中');
   var x = new XMLHttpRequest();
   x.open('POST', _sbUrl + '/rest/v1/workbench_data', true);
   var hdrs = _sbHeaders();
   Object.keys(hdrs).forEach(function(k){ x.setRequestHeader(k, hdrs[k]); });
   x.setRequestHeader('Prefer', 'resolution=merge-duplicates');
-  x.timeout = 10000;
+  x.timeout = 15000;
   x.onload = function() {
     if (x.status === 201 || x.status === 200) {
       _lastSync = Date.now(); _blobOnline = true;
       _updateSyncUI('ic-cloud', '已保存');
-      setTimeout(function(){ _updateSyncUI('', ''); }, 2000);
+      setTimeout(function(){ if (_blobOnline) _updateSyncUI('ic-cloud', '在线'); }, 2500);
     } else if (x.status === 409) {
-      /* 冲突重试 */
       setTimeout(function(){ _doUpsert(all, retry + 1); }, 500);
     } else {
-      _blobOnline = false; _updateSyncUI('ic-close', '离线');
+      _blobOnline = false; _updateSyncUI('ic-close', '离线('+x.status+')');
     }
   };
-  x.onerror = function() { _updateSyncUI('ic-close', '离线'); };
+  x.onerror = function() { _blobOnline = false; _updateSyncUI('ic-close', '网络错误'); };
+  x.ontimeout = function() { _blobOnline = false; _updateSyncUI('ic-close', '超时'); };
   x.send(JSON.stringify({
     share_id: _shareId,
     data: all,
@@ -1033,8 +1034,8 @@ function _updateSyncUI(icon, text) {
     var i = icon ? '<svg class="ic ic-sm"><use href="#'+icon+'"/></svg>' : '';
     el.innerHTML = i + '<span>'+text+'</span>';
     el.className = 'sync-indicator';
-    if (text === '在线' || text === '已同步' || text === '已保存') el.className = 'sync-indicator sync-online';
-    if (text === '离线') el.className = 'sync-indicator sync-offline';
+    if (text === '在线' || text === '已同步' || text === '已保存' || text === '保存中') el.className = 'sync-indicator sync-online';
+    if (text.indexOf('离线') === 0 || text === '网络错误' || text === '超时' || text === '保存失败') el.className = 'sync-indicator sync-offline';
   }
 }
 
@@ -1598,7 +1599,7 @@ function syncOut() {
   if (_isLocalFile) { T('请使用在线版打开此功能'); return; }
   _updateSyncUI('ic-refresh', '上传中');
   var all = {};
-  Object.keys(K).forEach(function(k){ var v = G(k, null); if (v !== null) all[k] = v; });
+  Object.keys(K).forEach(function(k){ var key = K[k]; var v = G(key, null); if (v !== null) all[key] = v; });
   _doUpsert(all, 0);
 }
 
@@ -1650,11 +1651,12 @@ function initAll() {
 function _loadFromCloud(silent) {
   if (_isLocalFile || _syncing) return;
   _syncing = true;
+  if (!silent) _updateSyncUI('ic-refresh', '连接中');
   var x = new XMLHttpRequest();
-  x.open('GET', _sbUrl + '/rest/v1/workbench_data?share_id=eq.' + encodeURIComponent(_shareId) + '&select=*', true);
+  x.open('GET', _sbUrl + '/rest/v1/workbench_data?share_id=eq.' + encodeURIComponent(_shareId) + '&select=*&order=updated_at.desc&limit=1', true);
   var hdrs = _sbHeaders();
   Object.keys(hdrs).forEach(function(k){ x.setRequestHeader(k, hdrs[k]); });
-  x.timeout = 12000;
+  x.timeout = 15000;
   var done = false;
   function finish(icon, text) {
     if (done) return; done = true;
@@ -1670,37 +1672,35 @@ function _loadFromCloud(silent) {
         if (rows && rows.length > 0) {
           var svr = rows[0].data || {};
           Object.keys(K).forEach(function(k) {
-            var sv = svr[k]; if (sv === undefined || sv === null) return;
-            var lv = G(k, null);
+            var key = K[k];
+            var sv = svr[key]; if (sv === undefined || sv === null) return;
+            var lv = G(key, null);
             if (JSON.stringify(sv) !== JSON.stringify(lv)) {
-              localStorage.setItem(k, JSON.stringify(sv)); merged = true;
+              localStorage.setItem(key, JSON.stringify(sv)); merged = true;
             }
           });
+        } else {
+          /* 云端无数据：把本地数据推上去 */
+          var all = {};
+          Object.keys(K).forEach(function(k){ var key = K[k]; var v = G(key, null); if (v !== null) all[key] = v; });
+          if (Object.keys(all).length > 0) { _doUpsert(all, 0); }
         }
         if (!_initialLoadDone) { _initialLoadDone = true; initAll(); }
         else if (merged) { initAll(); }
-        if (merged && !silent) { _updateSyncUI('ic-check', '已同步'); setTimeout(function(){ _updateSyncUI('', ''); }, 2000); }
+        if (!silent) {
+          if (merged) { _updateSyncUI('ic-check', '已同步'); setTimeout(function(){ if (_blobOnline) _updateSyncUI('ic-cloud', '在线'); }, 2000); }
+          else { _updateSyncUI('ic-cloud', '在线'); }
+        }
         finish();
-      } catch(e) { finish('ic-close', '离线'); }
-    } else if (x.status === 404 || (x.status === 200 && x.responseText === '[]')) {
-      /* 云端没有数据，初始化一条空记录 */
-      _blobOnline = true;
-      if (!_initialLoadDone) { _initialLoadDone = true; initAll(); }
-      /* 把本地数据推上去 */
-      var all = {};
-      Object.keys(K).forEach(function(k){ var v = G(k, null); if (v !== null) all[k] = v; });
-      if (Object.keys(all).length > 0) _doUpsert(all, 0);
-      finish();
+      } catch(e) { finish('ic-close', '数据错误'); }
     } else {
-      finish('ic-close', '离线');
+      finish('ic-close', '离线('+x.status+')');
     }
   };
-  x.onerror = function() { finish('ic-close', '离线'); };
-  x.ontimeout = function() { finish('ic-close', '离线'); };
-  if (!silent) _updateSyncUI('ic-refresh', '同步中');
+  x.onerror = function() { finish('ic-close', '网络错误'); };
+  x.ontimeout = function() { finish('ic-close', '超时'); };
   x.send();
-  /* 安全超时 */
-  setTimeout(function() { finish('ic-close', '离线'); }, 15000);
+  setTimeout(function() { finish('ic-close', '超时'); }, 18000);
 }
 
 /* 定时同步（每 10 秒检查一次云端） */
@@ -1713,7 +1713,9 @@ function startPolling() {
 /* 初始化云端同步 */
 function _initCloudSync() {
   if (_isLocalFile) return;
+  _updateSyncUI('ic-refresh', '连接中');
   _loadFromCloud(false);
+  /* 兜底：8 秒后不管结果如何都渲染页面 */
   setTimeout(function() { if (!_initialLoadDone) { _initialLoadDone = true; initAll(); } }, 8000);
   startPolling();
 }
